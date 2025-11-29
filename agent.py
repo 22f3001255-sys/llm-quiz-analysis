@@ -10,6 +10,7 @@ from tools import (
 from typing import TypedDict, Annotated, List
 from langchain_core.messages import trim_messages, HumanMessage
 from langchain.chat_models import init_chat_model
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.graph.message import add_messages
 import os
 from dotenv import load_dotenv
@@ -39,9 +40,9 @@ TOOLS = [
 # LLM INIT
 # -------------------------------------------------
 rate_limiter = InMemoryRateLimiter(
-    requests_per_second=4 / 60,
-    check_every_n_seconds=1,
-    max_bucket_size=4
+    requests_per_second=15 / 60,
+    check_every_n_seconds=0.1,
+    max_bucket_size=1
 )
 
 llm = init_chat_model(
@@ -99,62 +100,60 @@ def handle_malformed_node(state: AgentState):
 # -------------------------------------------------
 # AGENT NODE
 # -------------------------------------------------
+# -------------------------------------------------
+# AGENT NODE (WITH SLIDING WINDOW MEMORY)
+# -------------------------------------------------
 def agent_node(state: AgentState):
-    # --- TIME HANDLING START ---
+    # --- TIME TRACKING & LOGGING ---
     cur_time = time.time()
-    cur_url = os.getenv("url")
-    
-    # SAFE GET: Prevents crash if url is None or not in dict
-    prev_time = url_time.get(cur_url) 
+    cur_url = os.getenv("url", "Unknown URL")
+    prev_time = url_time.get(cur_url)
     offset = os.getenv("offset", "0")
 
     if prev_time is not None:
-        prev_time = float(prev_time)
-        diff = cur_time - prev_time
-
-        if diff >= 180 or (offset != "0" and (cur_time - float(offset)) > 90):
-            print(f"Timeout exceeded ({diff}s) — instructing LLM to purposely submit wrong answer.")
-
-            fail_instruction = """
-            You have exceeded the time limit for this task (over 180 seconds).
-            Immediately call the `post_request` tool and submit a WRONG answer for the CURRENT quiz.
-            """
-
-            # Using HumanMessage (as you correctly implemented)
-            fail_msg = HumanMessage(content=fail_instruction)
-
-            # We invoke the LLM immediately with this new instruction
-            result = llm.invoke(state["messages"] + [fail_msg])
-            return {"messages": [result]}
-    # --- TIME HANDLING END ---
-
-    trimmed_messages = trim_messages(
-        messages=state["messages"],
-        max_tokens=MAX_TOKENS,
-        strategy="last",
-        include_system=True,
-        start_on="human",
-        token_counter=llm, 
-    )
-    
-    # Better check: Does it have a HumanMessage?
-    has_human = any(msg.type == "human" for msg in trimmed_messages)
-    
-    if not has_human:
-        print("WARNING: Context was trimmed too far. Injecting state reminder.")
-        # We remind the agent of the current URL from the environment
-        current_url = os.getenv("url", "Unknown URL")
-        reminder = HumanMessage(content=f"Context cleared due to length. Continue processing URL: {current_url}")
+        diff = cur_time - float(prev_time)
+        print(f"\n⏱️  TIMER: {diff:.1f}s / 180s (Task: {cur_url})")
         
-        # We append this to the trimmed list (temporarily for this invoke)
-        trimmed_messages.append(reminder)
-    # ----------------------------------------
+        if diff >= 180 or (offset != "0" and (cur_time - float(offset)) > 90):
+            print(f"!!! TIMEOUT EXCEEDED ({diff:.1f}s) - FORCING WRONG ANSWER !!!")
+            fail_msg = HumanMessage(content="You have exceeded the time limit (180s). Immediately call `post_request` with a WRONG answer to skip.")
+            # Urgent invoke to handle the timeout immediately
+            return {"messages": [llm.invoke(state["messages"] + [fail_msg])]}
+    # -------------------------------
+
+
+    # --- MEMORY OPTIMIZATION (THE FIX) ---
+    all_messages = state["messages"]
+    
+    # 1. Identify System Prompt (Always index 0)
+    system_prompt = all_messages[0]
+    
+    # 2. Get the conversation history (excluding system prompt)
+    history = all_messages[1:]
+    
+    # 3. SLIDING WINDOW: Keep only the last 10 messages
+    # This is plenty for solving ONE quiz, but forgets the previous completed ones.
+    if len(history) > 15:
+        print(f"✂️  Trimming history: Dropping {len(history) - 15} old messages...")
+        history = history[-15:]
+        
+        # 4. SAFETY: Ensure we don't start with a 'ToolMessage'
+        # (A ToolMessage must always follow an AIMessage. If we cut the parent, we must cut the child.)
+        while len(history) > 0 and isinstance(history[0], (ToolMessage, FunctionMessage)):
+            history.pop(0)
+
+    # Reconstruct: System Prompt + Recent History
+    trimmed_messages = [system_prompt] + history
+    state["messages"] = trimmed_messages
+    # -------------------------------------
+
 
     print(f"--- INVOKING AGENT (Context: {len(trimmed_messages)} items) ---")
     
-    result = llm.invoke(trimmed_messages)
-
-    return {"messages": [result]}
+    # Generate response
+    response = llm.invoke(trimmed_messages)
+    
+    return {"messages": [response]}
 
 
 # -------------------------------------------------
